@@ -13,7 +13,15 @@ from textual.binding import Binding
 from textual.message import Message
 from textual.widgets import Footer, Header, Static
 
-from pingtop.models import HostId, PingEngine, PingResult, SortKey
+from pingtop.models import (
+    Generation,
+    HostId,
+    PingEngine,
+    PingResult,
+    SampleSeq,
+    SampleStatus,
+    SortKey,
+)
 from pingtop.screens.host_form import ConfirmScreen, HelpScreen, HostFormScreen
 from pingtop.session import PingSession
 from pingtop.widgets.details_panel import DetailsPanel
@@ -25,13 +33,36 @@ logger = logging.getLogger(__name__)
 @dataclass(slots=True)
 class PendingUpdate:
     host_id: HostId
+    generation: Generation
+    seq: SampleSeq
     result: PingResult
 
 
 class PingSample(Message):
-    def __init__(self, host_id: HostId, result: PingResult) -> None:
+    def __init__(
+        self,
+        host_id: HostId,
+        generation: Generation,
+        seq: SampleSeq,
+        result: PingResult,
+    ) -> None:
         self.host_id = host_id
+        self.generation = generation
+        self.seq = seq
         self.result = result
+        super().__init__()
+
+
+class EditConfirmed(Message):
+    def __init__(self, host_id: HostId, target: str) -> None:
+        self.host_id = host_id
+        self.target = target
+        super().__init__()
+
+
+class DeleteConfirmed(Message):
+    def __init__(self, host_id: HostId) -> None:
+        self.host_id = host_id
         super().__init__()
 
 
@@ -72,6 +103,9 @@ class PingTopApp(App[None]):
         self.engine = engine
         self._ping_tasks: dict[HostId, asyncio.Task[None]] = {}
         self._pending_updates: deque[PendingUpdate] = deque()
+        self.stale_host_count = 0
+        self.stale_generation_count = 0
+        self.stale_seq_count = 0
         self._last_sort_refresh = 0.0
         self._last_fd_log = 0.0
         self._details_visible = False
@@ -101,8 +135,8 @@ class PingTopApp(App[None]):
         if self.session.selected_host_id:
             self.table.select_host(self.session.selected_host_id, scroll=False)
 
-    def on_unmount(self) -> None:
-        self._stop_all_ping_tasks()
+    async def on_unmount(self) -> None:
+        await self._stop_all_ping_tasks()
 
     def on_resize(self, event: events.Resize) -> None:
         if not hasattr(self, "table"):
@@ -143,8 +177,8 @@ class PingTopApp(App[None]):
         self._sync_all_rows()
         self._refresh_status_strip()
 
-    def action_quit_session(self) -> None:
-        self._stop_all_ping_tasks()
+    async def action_quit_session(self) -> None:
+        await self._stop_all_ping_tasks()
         self.exit()
 
     def action_add_host(self) -> None:
@@ -185,18 +219,21 @@ class PingTopApp(App[None]):
         self._refresh_status_strip()
         self._refresh_selected_details()
 
-    def action_reset_selected(self) -> None:
+    async def action_reset_selected(self) -> None:
         record = self.session.current_host()
         if record is None:
             self.notify("No host selected.", severity="warning")
             return
-        self.session.reset_host(record.config.id)
-        self._refresh_host(record.config.id)
+        host_id = record.config.id
+        self.session.reset_host(host_id)
+        await self._restart_ping_task(host_id)
+        self._refresh_host(host_id)
 
-    def action_reset_all(self) -> None:
+    async def action_reset_all(self) -> None:
         self.session.reset_all()
+        for host_id in list(self.session.hosts):
+            await self._restart_ping_task(host_id)
         self._sync_all_rows()
-        self._refresh_selected_details()
         self._refresh_status_strip()
 
     def action_sort_by(self, column_key: str) -> None:
@@ -210,7 +247,11 @@ class PingTopApp(App[None]):
 
     @on(PingSample)
     def on_ping_sample(self, message: PingSample) -> None:
-        self._pending_updates.append(PendingUpdate(message.host_id, message.result))
+        self._pending_updates.append(
+            PendingUpdate(
+                message.host_id, message.generation, message.seq, message.result
+            )
+        )
 
     def flush_updates(self) -> None:
         now = asyncio.get_running_loop().time()
@@ -221,9 +262,22 @@ class PingTopApp(App[None]):
         while self._pending_updates:
             pending = self._pending_updates.popleft()
             if pending.host_id not in self.session.hosts:
+                self.stale_host_count += 1
                 continue
-            self.session.apply_result(pending.host_id, pending.result)
-            touched.add(pending.host_id)
+            status = self.session.accept_result(
+                pending.host_id,
+                pending.result,
+                generation=pending.generation,
+                seq=pending.seq,
+            )
+            if status is SampleStatus.ACCEPTED:
+                touched.add(pending.host_id)
+            elif status is SampleStatus.STALE_GENERATION:
+                # Result was issued for an earlier target or pre-reset window.
+                self.stale_generation_count += 1
+            elif status is SampleStatus.STALE_SEQ:
+                # Duplicate delivery or out-of-order within the generation.
+                self.stale_seq_count += 1
         for host_id in touched:
             self._refresh_host(host_id)
         if touched and (now - self._last_sort_refresh) >= 1.0:
@@ -286,45 +340,75 @@ class PingTopApp(App[None]):
         self._start_ping_task(host_id)
         self._sync_all_rows()
 
+    @on(EditConfirmed)
+    async def on_edit_confirmed(self, message: EditConfirmed) -> None:
+        await self._commit_edit_host(message.host_id, message.target)
+
+    @on(DeleteConfirmed)
+    async def on_delete_confirmed(self, message: DeleteConfirmed) -> None:
+        await self._commit_delete_host(message.host_id)
+
     def _handle_edit_host(self, host_id: HostId, target: str | None) -> None:
         if target is None:
             return
+        self.post_message(EditConfirmed(host_id, target))
+
+    async def _commit_edit_host(self, host_id: HostId, target: str) -> None:
         try:
             self.session.edit_host(host_id, target)
         except ValueError as exc:
             self.notify(str(exc), severity="error")
             return
-        self._restart_ping_task(host_id)
+        # Bump already happened, but wait for the old probe's cancellation to be
+        # confirmed before arming the new generation's loop.
+        await self._restart_ping_task(host_id)
         self._refresh_host(host_id)
         self._refresh_status_strip()
 
     def _handle_delete_host(self, host_id: HostId, confirmed: bool | None) -> None:
         if not confirmed:
             return
-        self._stop_ping_task(host_id)
+        self.post_message(DeleteConfirmed(host_id))
+
+    async def _commit_delete_host(self, host_id: HostId) -> None:
+        # Wait for cancellation confirmation before the host disappears.
+        await self._stop_ping_task(host_id)
+        if host_id not in self.session.hosts:
+            return
+        self._discard_pending_updates(host_id)
         self.session.delete_host(host_id)
         self.table.remove_host(host_id)
         self.table.select_host(self.session.selected_host_id, scroll=False)
         self._refresh_selected_details()
         self._refresh_status_strip()
 
+    def _discard_pending_updates(self, host_id: HostId) -> None:
+        self._pending_updates = deque(
+            update for update in self._pending_updates if update.host_id != host_id
+        )
+
     def _start_ping_task(self, host_id: HostId) -> None:
         if host_id in self._ping_tasks:
             return
         self._ping_tasks[host_id] = asyncio.create_task(self._run_host_loop(host_id))
 
-    def _restart_ping_task(self, host_id: HostId) -> None:
-        self._stop_ping_task(host_id)
+    async def _restart_ping_task(self, host_id: HostId) -> None:
+        await self._stop_ping_task(host_id)
         self._start_ping_task(host_id)
 
-    def _stop_ping_task(self, host_id: HostId) -> None:
+    async def _stop_ping_task(self, host_id: HostId) -> None:
         task = self._ping_tasks.pop(host_id, None)
-        if task is not None:
-            task.cancel()
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
-    def _stop_all_ping_tasks(self) -> None:
+    async def _stop_all_ping_tasks(self) -> None:
         for host_id in list(self._ping_tasks):
-            self._stop_ping_task(host_id)
+            await self._stop_ping_task(host_id)
 
     def _apply_responsive_layout(self, force: bool = False) -> bool:
         changed = False
@@ -401,14 +485,22 @@ class PingTopApp(App[None]):
 
     async def _run_host_loop(self, host_id: HostId) -> None:
         flag = int(host_id[:2], 16)
+        record = self.session.hosts.get(host_id)
+        if record is None:
+            return
+        # Pin the generation this loop is serving and number every probe it
+        # issues strictly within that generation.
+        generation = record.generation
+        probe_seq: SampleSeq = 0
         try:
             while True:
                 record = self.session.hosts.get(host_id)
-                if record is None:
+                if record is None or record.generation != generation:
                     return
                 if record.paused:
                     await asyncio.sleep(0.1)
                     continue
+                probe_seq += 1
                 target = record.config.target
                 result = await self.engine.ping_once(
                     target=target,
@@ -416,7 +508,9 @@ class PingTopApp(App[None]):
                     packet_size=self.session.config.packet_size,
                     flag=flag,
                 )
-                self.post_message(PingSample(host_id, result))
+                self.post_message(
+                    PingSample(host_id, generation, probe_seq, result)
+                )
                 await asyncio.sleep(self.session.config.interval)
         except asyncio.CancelledError:
             raise

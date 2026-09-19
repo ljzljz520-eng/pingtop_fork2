@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import gc
+import socket
+import warnings
 from collections import defaultdict
 
 import pytest
 from rich.text import Text
 from textual.widgets import Static
 
-from pingtop.app import PingTopApp
-from pingtop.models import PingResult, SessionConfig, SortKey
+from pingtop.app import PendingUpdate, PingSample, PingTopApp
+from pingtop.models import PingResult, SampleStatus, SessionConfig, SortKey
 from pingtop.session import PingSession
 from pingtop.widgets.details_panel import DetailsPanel
 from pingtop.widgets.host_table import HostTable
@@ -27,6 +31,65 @@ class FakeEngine:
         if count % 3 == 0:
             return PingResult(success=False, resolved_ip="127.0.0.1")
         return PingResult(success=True, rtt_ms=10.0 + count, resolved_ip="127.0.0.1")
+
+
+class GatedEngine:
+    """Engine whose probes block inside the call until explicitly released."""
+
+    def __init__(self, result: PingResult | None = None) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+        self._result = result or PingResult(
+            success=True, rtt_ms=99.0, resolved_ip="99.99.99.99"
+        )
+
+    async def ping_once(
+        self, target: str, timeout: float, packet_size: int, flag: int
+    ) -> PingResult:
+        self.calls += 1
+        self.entered.set()
+        await self.release.wait()
+        return self._result
+
+
+class GatedSocketEngine:
+    """Gated engine that opens a real socket per probe and closes on exit."""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.sockets: list[socket.socket] = []
+
+    async def ping_once(
+        self, target: str, timeout: float, packet_size: int, flag: int
+    ) -> PingResult:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setblocking(False)
+        self.sockets.append(sock)
+        self.entered.set()
+        try:
+            await self.release.wait()
+            return PingResult(
+                success=True, rtt_ms=12.0, resolved_ip="1.1.1.1"
+            )
+        finally:
+            sock.close()
+
+
+async def _wait_entered(
+    pilot, entered: asyncio.Event, *, timeout: float = 2.0
+) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not entered.is_set():
+        if loop.time() > deadline:
+            raise AssertionError("engine probe never entered")
+        await pilot.pause(0.01)
+
+
+def _all_sockets_closed(engine: GatedSocketEngine) -> bool:
+    return all(sock.fileno() == -1 for sock in engine.sockets)
 
 
 class FakeTable:
@@ -70,7 +133,7 @@ async def test_app_host_lifecycle_actions() -> None:
 
         selected = session.selected_host_id
         assert selected is not None
-        app._handle_edit_host(selected, "9.9.9.9")
+        await app._commit_edit_host(selected, "9.9.9.9")
         assert session.hosts[selected].config.target == "9.9.9.9"
 
         app.action_toggle_selected_pause()
@@ -79,10 +142,10 @@ async def test_app_host_lifecycle_actions() -> None:
         app.action_toggle_selected_pause()
         assert session.hosts[selected].paused is False
 
-        app.action_reset_selected()
+        await app.action_reset_selected()
         assert session.hosts[selected].stats.seq == 0
 
-        app._handle_delete_host(selected, True)
+        await app._commit_delete_host(selected)
         assert selected not in session.hosts
         await pilot.press("q")
 
@@ -240,3 +303,255 @@ def test_restore_table_viewport_coalesces_after_refresh_callbacks() -> None:
         "immediate": True,
         "force": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_late_old_target_result_is_stale_and_changes_nothing() -> None:
+    engine = GatedEngine()
+    session = PingSession(
+        SessionConfig(interval=10.0, timeout=10.0), ["1.1.1.1"]
+    )
+    host_id = next(iter(session.hosts))
+    app = PingTopApp(session=session, engine=engine)
+
+    async with app.run_test() as pilot:
+        await _wait_entered(pilot, engine.entered)
+        old_generation = session.hosts[host_id].generation
+
+        await app._commit_edit_host(host_id, "2.2.2.2")
+        new_generation = session.hosts[host_id].generation
+        assert new_generation == old_generation + 1
+
+        # The new generation establishes its own measurement window.
+        assert (
+            session.accept_result(
+                host_id,
+                PingResult(success=True, rtt_ms=11.0, resolved_ip="2.2.2.2"),
+                generation=new_generation,
+                seq=1,
+            )
+            is SampleStatus.ACCEPTED
+        )
+        before = dict(session.host_snapshot(host_id))
+
+        # Fake engine returns the old target's result after edit completed.
+        app.post_message(
+            PingSample(
+                host_id,
+                old_generation,
+                7,
+                PingResult(success=True, rtt_ms=999.0, resolved_ip="9.9.9.9"),
+            )
+        )
+        await pilot.pause(0.35)
+
+        assert app.stale_generation_count == 1
+        after = session.host_snapshot(host_id)
+        for key in (
+            "seq",
+            "last_rtt_ms",
+            "resolved_ip",
+            "lost",
+            "loss_percent",
+            "history_ms",
+        ):
+            assert after[key] == before[key]
+
+        # The stale high sequence number did not move the generation's
+        # water mark, so the next in-order sample is accepted.
+        assert (
+            session.accept_result(
+                host_id,
+                PingResult(success=True, rtt_ms=12.0, resolved_ip="2.2.2.2"),
+                generation=new_generation,
+                seq=2,
+            )
+            is SampleStatus.ACCEPTED
+        )
+        await pilot.press("q")
+
+
+@pytest.mark.asyncio
+async def test_reset_with_inflight_probe_keeps_clean_generation_window() -> None:
+    engine = GatedEngine()
+    session = PingSession(
+        SessionConfig(interval=10.0, timeout=10.0), ["1.1.1.1"]
+    )
+    host_id = next(iter(session.hosts))
+    app = PingTopApp(session=session, engine=engine)
+
+    async with app.run_test() as pilot:
+        await _wait_entered(pilot, engine.entered)
+        old_task = app._ping_tasks[host_id]
+        old_generation = session.hosts[host_id].generation
+        stale_before = app.stale_generation_count
+
+        await app.action_reset_selected()
+
+        stats = session.hosts[host_id].stats
+        assert stats.seq == 0
+        assert stats.lost == 0
+        assert stats.last_rtt_ms is None
+        assert stats.loss_percent == 0.0
+        assert stats.history_ms == []
+        assert stats.accepted_seq == 0
+        new_generation = session.hosts[host_id].generation
+        assert new_generation == old_generation + 1
+        # Cancellation was confirmed and a fresh loop serves the new window.
+        assert old_task.done()
+        new_task = app._ping_tasks[host_id]
+        assert new_task is not old_task
+        assert not new_task.done()
+
+        # Late result from the probe that was in flight when reset ran.
+        app.post_message(
+            PingSample(
+                host_id,
+                old_generation,
+                1,
+                PingResult(success=True, rtt_ms=999.0, resolved_ip="9.9.9.9"),
+            )
+        )
+        await pilot.pause(0.35)
+        assert app.stale_generation_count == stale_before + 1
+        assert stats.seq == 0
+
+        # Only a probe issued after the reset can become sequence number 1.
+        engine.release.set()
+        await pilot.pause(0.35)
+        assert stats.seq == 1
+        assert stats.accepted_seq == 1
+        assert stats.last_rtt_ms == 99.0
+        assert stats.resolved_ip == "99.99.99.99"
+        await pilot.press("q")
+
+
+@pytest.mark.asyncio
+async def test_app_level_duplicate_and_out_of_order_do_not_double_count() -> None:
+    engine = GatedEngine()
+    session = PingSession(
+        SessionConfig(interval=10.0, timeout=10.0), ["1.1.1.1"]
+    )
+    host_id = next(iter(session.hosts))
+    app = PingTopApp(session=session, engine=engine)
+
+    async with app.run_test() as pilot:
+        await _wait_entered(pilot, engine.entered)
+        generation = session.hosts[host_id].generation
+
+        for seq in range(1, 4):
+            app._pending_updates.append(
+                PendingUpdate(
+                    host_id,
+                    generation,
+                    seq,
+                    PingResult(
+                        success=True, rtt_ms=float(seq), resolved_ip="1.1.1.1"
+                    ),
+                )
+            )
+        app.flush_updates()
+        stats = session.hosts[host_id].stats
+        assert stats.seq == 3
+
+        # Out-of-order older sample, then duplicate of the accepted high mark.
+        app._pending_updates.append(
+            PendingUpdate(
+                host_id,
+                generation,
+                2,
+                PingResult(success=True, rtt_ms=888.0, resolved_ip="8.8.8.8"),
+            )
+        )
+        app._pending_updates.append(
+            PendingUpdate(
+                host_id,
+                generation,
+                3,
+                PingResult(success=True, rtt_ms=999.0, resolved_ip="9.9.9.9"),
+            )
+        )
+        app.flush_updates()
+        assert stats.seq == 3
+        assert app.stale_seq_count == 2
+        assert stats.last_rtt_ms == 3.0
+        assert stats.resolved_ip == "1.1.1.1"
+        assert stats.history_ms == [1.0, 2.0, 3.0]
+
+        # The next fresh probe is still accepted exactly once.
+        app._pending_updates.append(
+            PendingUpdate(
+                host_id,
+                generation,
+                4,
+                PingResult(success=True, rtt_ms=4.0, resolved_ip="1.1.1.1"),
+            )
+        )
+        app.flush_updates()
+        assert stats.seq == 4
+        await pilot.press("q")
+
+
+@pytest.mark.asyncio
+async def test_delete_host_waits_for_cancel_and_closes_sockets() -> None:
+    engine = GatedSocketEngine()
+    session = PingSession(
+        SessionConfig(interval=10.0, timeout=10.0), ["1.1.1.1"]
+    )
+    host_id = next(iter(session.hosts))
+    app = PingTopApp(session=session, engine=engine)
+
+    async with app.run_test() as pilot:
+        await _wait_entered(pilot, engine.entered)
+        old_task = app._ping_tasks[host_id]
+
+        # Exercise the actual confirmation callback -> message path.
+        app._handle_delete_host(host_id, True)
+        await pilot.pause(0.1)
+
+        assert host_id not in session.hosts
+        assert app._ping_tasks == {}
+        assert old_task.done()
+        assert _all_sockets_closed(engine)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ResourceWarning)
+        gc.collect()
+
+
+@pytest.mark.asyncio
+async def test_quit_waits_for_cancel_without_leftover_tasks_or_sockets() -> None:
+    engine = GatedSocketEngine()
+    session = PingSession(
+        SessionConfig(interval=10.0, timeout=10.0),
+        ["1.1.1.1", "2.2.2.2"],
+    )
+    app = PingTopApp(session=session, engine=engine)
+
+    async with app.run_test() as pilot:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 2.0
+        while len(engine.sockets) < 2:
+            if loop.time() > deadline:
+                raise AssertionError("both probes never became in flight")
+            await pilot.pause(0.01)
+        tasks_before = dict(app._ping_tasks)
+
+        await pilot.press("q")
+        await pilot.pause(0.35)
+
+        assert app._ping_tasks == {}
+        assert all(task.done() for task in tasks_before.values())
+        assert _all_sockets_closed(engine)
+
+    loop = asyncio.get_running_loop()
+    leftover_tasks = [
+        task
+        for task in asyncio.all_tasks(loop)
+        if not task.done() and task is not asyncio.current_task()
+    ]
+    assert not leftover_tasks
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ResourceWarning)
+        gc.collect()

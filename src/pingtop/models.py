@@ -7,6 +7,8 @@ from statistics import stdev
 from typing import Protocol
 
 HostId = str
+Generation = int
+SampleSeq = int
 MAX_HISTORY = 256
 TREND_BLOCKS = "▁▂▃▄▅▆▇█"
 TIMEOUT_MARKER = "╳"
@@ -18,6 +20,14 @@ class HostState(str, Enum):
     PAUSED = "paused"
     ERROR = "error"
     DELETED = "deleted"
+
+
+class SampleStatus(str, Enum):
+    """Outcome of gating a delivered probe sample."""
+
+    ACCEPTED = "accepted"
+    STALE_GENERATION = "stale_generation"
+    STALE_SEQ = "stale_seq"
 
 
 class ExportFormat(str, Enum):
@@ -90,6 +100,7 @@ class HostStats:
     last_error: str | None = None
     state: HostState = HostState.PENDING
     last_updated_at: datetime | None = None
+    accepted_seq: SampleSeq = 0
 
     def register_timeout(self, when: datetime) -> None:
         self.seq += 1
@@ -132,9 +143,8 @@ class HostStats:
     def mark_deleted(self) -> None:
         self.state = HostState.DELETED
 
-    def reset(self) -> None:
-        current_ip = self.resolved_ip
-        self.resolved_ip = current_ip
+    def reset(self, keep_ip: bool = True) -> None:
+        self.resolved_ip = self.resolved_ip if keep_ip else None
         self.seq = 0
         self.last_rtt_ms = None
         self.min_rtt_ms = None
@@ -147,6 +157,7 @@ class HostStats:
         self.trend = ""
         self.last_error = None
         self.last_updated_at = None
+        self.accepted_seq = 0
         self.state = HostState.PENDING
 
     def snapshot(self) -> dict[str, object]:
@@ -170,6 +181,7 @@ class HostRecord:
     config: HostConfig
     stats: HostStats = field(default_factory=HostStats)
     paused: bool = False
+    generation: Generation = 1
 
     def snapshot(self) -> dict[str, object]:
         return {

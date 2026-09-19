@@ -7,11 +7,14 @@ from uuid import uuid4
 
 from pingtop.models import (
     ExportFormat,
+    Generation,
     HostConfig,
     HostId,
     HostRecord,
     HostState,
     PingResult,
+    SampleSeq,
+    SampleStatus,
     SessionConfig,
     SessionSnapshot,
     SortKey,
@@ -73,7 +76,9 @@ class PingSession:
             if normalize_target(existing.config.target) == normalized:
                 raise ValueError(f"Host '{clean_target}' already exists.")
         record.config.target = clean_target
-        record.stats.reset()
+        # Editing the target opens a new measurement window: results issued
+        # for the old target must never land in this window.
+        self._bump_generation(record, keep_ip=False)
 
     def delete_host(self, host_id: HostId) -> None:
         record = self.require_host(host_id)
@@ -115,13 +120,47 @@ class PingSession:
 
     def reset_host(self, host_id: HostId) -> None:
         record = self.require_host(host_id)
-        record.stats.reset()
+        # A reset closes the measurement window as well: probes issued before
+        # the reset must not be counted in the fresh window.
+        self._bump_generation(record, keep_ip=True)
         if record.paused:
             record.stats.mark_paused()
 
     def reset_all(self) -> None:
         for host_id in list(self._hosts):
             self.reset_host(host_id)
+
+    def accept_result(
+        self,
+        host_id: HostId,
+        result: PingResult,
+        *,
+        generation: Generation,
+        seq: SampleSeq,
+        when: datetime | None = None,
+    ) -> SampleStatus:
+        """Gate a delivered probe sample before it touches statistics.
+
+        A sample is accepted only when it was issued for the host's current
+        generation and its probe sequence number is strictly greater than the
+        last one accepted. This rejects late results from prior targets or
+        pre-reset probes (stale generation) as well as duplicate and
+        out-of-order delivery within a generation.
+        """
+        when = when or utcnow()
+        record = self.require_host(host_id)
+        if generation != record.generation:
+            return SampleStatus.STALE_GENERATION
+        if seq <= record.stats.accepted_seq:
+            return SampleStatus.STALE_SEQ
+        record.stats.accepted_seq = seq
+        self.apply_result(host_id, result, when)
+        return SampleStatus.ACCEPTED
+
+    @staticmethod
+    def _bump_generation(record: HostRecord, *, keep_ip: bool) -> None:
+        record.generation += 1
+        record.stats.reset(keep_ip=keep_ip)
 
     def apply_result(
         self, host_id: HostId, result: PingResult, when: datetime | None = None
